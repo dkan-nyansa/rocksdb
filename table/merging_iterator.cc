@@ -1738,7 +1738,8 @@ void MergeIteratorBuilder::AddPointAndTombstoneIterator(
   }
 }
 
-InternalIterator* MergeIteratorBuilder::Finish(ArenaWrappedDBIter* db_iter) {
+InternalIterator* MergeIteratorBuilder::Finish(ArenaWrappedDBIter* db_iter,
+                                               bool has_memtable_iter) {
   InternalIterator* ret = nullptr;
   if (!use_merging_iter) {
     ret = first_iter;
@@ -1747,7 +1748,8 @@ InternalIterator* MergeIteratorBuilder::Finish(ArenaWrappedDBIter* db_iter) {
     for (auto& p : range_del_iter_ptrs_) {
       *(p.second) = &(merge_iter->range_tombstone_iters_[p.first]);
     }
-    if (db_iter && !merge_iter->range_tombstone_iters_.empty()) {
+    if (db_iter && has_memtable_iter &&
+        !merge_iter->range_tombstone_iters_.empty()) {
       // memtable is always the first level
       db_iter->SetMemtableRangetombstoneIter(
           &merge_iter->range_tombstone_iters_.front());

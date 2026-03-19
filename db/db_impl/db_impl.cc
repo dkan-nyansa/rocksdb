@@ -2250,28 +2250,33 @@ InternalIterator* DBImpl::NewInternalIterator(
       // here, and no unit test cares about the value provided here.
       !read_options.total_order_seek && prefix_extractor != nullptr,
       read_options.iterate_upper_bound);
-  // Collect iterator for mutable memtable
-  auto mem_iter = super_version->mem->NewIterator(
-      read_options, super_version->GetSeqnoToTimeMapping(), arena,
-      super_version->mutable_cf_options.prefix_extractor.get(),
-      /*for_flush=*/false);
+  const bool has_active_mem_entries = !super_version->mem->IsEmpty();
   Status s;
-  if (!read_options.ignore_range_deletions) {
-    std::unique_ptr<TruncatedRangeDelIterator> mem_tombstone_iter;
-    auto range_del_iter = super_version->mem->NewRangeTombstoneIterator(
-        read_options, sequence, false /* immutable_memtable */);
-    if (range_del_iter == nullptr || range_del_iter->empty()) {
-      delete range_del_iter;
+  // Collect iterator for mutable memtable only when it contains entries. DBIter
+  // still receives the active memtable pointer separately for flush-trigger
+  // bookkeeping.
+  if (has_active_mem_entries) {
+    auto mem_iter = super_version->mem->NewIterator(
+        read_options, super_version->GetSeqnoToTimeMapping(), arena,
+        super_version->mutable_cf_options.prefix_extractor.get(),
+        /*for_flush=*/false);
+    if (!read_options.ignore_range_deletions) {
+      std::unique_ptr<TruncatedRangeDelIterator> mem_tombstone_iter;
+      auto range_del_iter = super_version->mem->NewRangeTombstoneIterator(
+          read_options, sequence, false /* immutable_memtable */);
+      if (range_del_iter == nullptr || range_del_iter->empty()) {
+        delete range_del_iter;
+      } else {
+        mem_tombstone_iter = std::make_unique<TruncatedRangeDelIterator>(
+            std::unique_ptr<FragmentedRangeTombstoneIterator>(range_del_iter),
+            &cfd->ioptions().internal_comparator, nullptr /* smallest */,
+            nullptr /* largest */);
+      }
+      merge_iter_builder.AddPointAndTombstoneIterator(
+          mem_iter, std::move(mem_tombstone_iter));
     } else {
-      mem_tombstone_iter = std::make_unique<TruncatedRangeDelIterator>(
-          std::unique_ptr<FragmentedRangeTombstoneIterator>(range_del_iter),
-          &cfd->ioptions().internal_comparator, nullptr /* smallest */,
-          nullptr /* largest */);
+      merge_iter_builder.AddIterator(mem_iter);
     }
-    merge_iter_builder.AddPointAndTombstoneIterator(
-        mem_iter, std::move(mem_tombstone_iter));
-  } else {
-    merge_iter_builder.AddIterator(mem_iter);
   }
 
   // Collect all needed child iterators for immutable memtables
@@ -2290,7 +2295,11 @@ InternalIterator* DBImpl::NewInternalIterator(
                                            allow_unprepared_value);
     }
     internal_iter = merge_iter_builder.Finish(
-        read_options.ignore_range_deletions ? nullptr : db_iter);
+        read_options.ignore_range_deletions ? nullptr : db_iter,
+        has_active_mem_entries);
+    if (internal_iter == nullptr) {
+      internal_iter = NewEmptyInternalIterator<Slice>(arena);
+    }
     SuperVersionHandle* cleanup = new SuperVersionHandle(
         this, &mutex_, super_version,
         read_options.background_purge_on_iterator_cleanup ||

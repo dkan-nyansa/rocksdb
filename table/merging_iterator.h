@@ -84,7 +84,8 @@ class MergeIteratorBuilder {
   // will be called with pointer to where the merging iterator
   // stores the memtable range tombstone iterator.
   // This is used for DB iterator to refresh memtable range tombstones.
-  InternalIterator* Finish(ArenaWrappedDBIter* db_iter = nullptr);
+  InternalIterator* Finish(ArenaWrappedDBIter* db_iter = nullptr,
+                           bool has_memtable_iter = true);
 
  private:
   MergingIterator* merge_iter;
