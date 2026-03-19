@@ -512,16 +512,22 @@ Status TableCache::Get(const ReadOptions& options,
         get_context->max_covering_tombstone_seq();
     if (s.ok() && max_covering_tombstone_seq != nullptr &&
         !options.ignore_range_deletions) {
-      std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
-          t->NewRangeTombstoneIterator(options));
-      if (range_del_iter != nullptr) {
-        SequenceNumber seq =
-            range_del_iter->MaxCoveringTombstoneSeqnum(ExtractUserKey(k));
-        if (seq > *max_covering_tombstone_seq) {
-          *max_covering_tombstone_seq = seq;
-          if (get_context->NeedTimestamp()) {
-            get_context->SetTimestampFromRangeTombstone(
-                range_del_iter->timestamp());
+      const auto table_properties = t->GetTableProperties();
+      const bool has_range_deletions =
+          table_properties != nullptr &&
+          table_properties->num_range_deletions > 0;
+      if (has_range_deletions) {
+        std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter(
+            t->NewRangeTombstoneIterator(options));
+        if (range_del_iter != nullptr) {
+          SequenceNumber seq =
+              range_del_iter->MaxCoveringTombstoneSeqnum(ExtractUserKey(k));
+          if (seq > *max_covering_tombstone_seq) {
+            *max_covering_tombstone_seq = seq;
+            if (get_context->NeedTimestamp()) {
+              get_context->SetTimestampFromRangeTombstone(
+                  range_del_iter->timestamp());
+            }
           }
         }
       }
