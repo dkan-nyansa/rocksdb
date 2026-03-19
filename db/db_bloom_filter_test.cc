@@ -2759,6 +2759,44 @@ TEST_F(DBBloomFilterTest,
   ASSERT_EQ(1, get_perf_context()->bloom_sst_miss_count);
 }
 
+TEST_F(DBBloomFilterTest, FilterlessSstBuildsAdaptiveReadFilter) {
+  Options options = CurrentOptions();
+  BlockBasedTableOptions table_options;
+  SetInTableOptions(&table_options);
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+
+  CreateAndReopenWithCF({"pikachu"}, options);
+  ASSERT_OK(Put(1, "AAAA", "Value1"));
+  ASSERT_OK(Put(1, "ZBRA", "Value3"));
+  ASSERT_OK(Flush(1));
+
+  ReopenWithColumnFamilies({"default", "pikachu"}, options);
+
+  get_perf_context()->Reset();
+  ASSERT_EQ("Value1", Get(1, "AAAA"));
+  ASSERT_EQ(0, get_perf_context()->bloom_sst_hit_count);
+  ASSERT_EQ(0, get_perf_context()->bloom_sst_miss_count);
+
+  get_perf_context()->Reset();
+  ASSERT_EQ("NOT_FOUND", Get(1, "RXDB"));
+  ASSERT_EQ(0, get_perf_context()->bloom_sst_hit_count);
+  ASSERT_EQ(0, get_perf_context()->bloom_sst_miss_count);
+
+  bool filter_ready = false;
+  for (int i = 0; i < 100 && !filter_ready; ++i) {
+    env_->SleepForMicroseconds(10 * 1000);
+    get_perf_context()->Reset();
+    ASSERT_EQ("NOT_FOUND", Get(1, "RXDB"));
+    filter_ready = get_perf_context()->bloom_sst_miss_count == 1;
+  }
+
+  ASSERT_TRUE(filter_ready);
+  get_perf_context()->Reset();
+  ASSERT_EQ("Value1", Get(1, "AAAA"));
+  ASSERT_EQ(1, get_perf_context()->bloom_sst_hit_count);
+  ASSERT_EQ(0, get_perf_context()->bloom_sst_miss_count);
+}
+
 // Same scenario as in BloomStatsTest but using an iterator
 TEST_P(BloomStatsTestWithParam, BloomStatsTestWithIter) {
   std::string key1("AAAA");

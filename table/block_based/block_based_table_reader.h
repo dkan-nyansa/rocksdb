@@ -9,8 +9,10 @@
 
 #pragma once
 
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 
 #include "cache/cache_entry_roles.h"
 #include "cache/cache_key.h"
@@ -495,6 +497,13 @@ class BlockBasedTable : public TableReader {
                               const SliceTransform* prefix_extractor,
                               BlockCacheLookupContext* lookup_context,
                               const ReadOptions& read_options) const;
+  FilterBlockReader* GetFilterForRead(const ReadOptions& read_options,
+                                      bool skip_filters);
+  bool ShouldBuildAdaptiveFilter() const;
+  void MaybeScheduleAdaptiveFilterBuild(const ReadOptions& read_options);
+  Status BuildAdaptiveFilter();
+  void RunAdaptiveFilterBuild();
+  static void BackgroundBuildAdaptiveFilter(void* arg);
 
   // If force_direct_prefetch is true, always prefetching to RocksDB
   //    buffer, rather than calling RandomAccessFile::Prefetch().
@@ -644,6 +653,15 @@ struct BlockBasedTable::Rep {
   std::unique_ptr<IndexReader> index_reader;
   std::unique_ptr<FilterBlockReader> filter;
   std::unique_ptr<UncompressionDictReader> uncompression_dict_reader;
+  std::mutex adaptive_filter_mu;
+  std::condition_variable adaptive_filter_cv;
+  std::unique_ptr<FilterBlockReader> adaptive_filter;
+  std::atomic<FilterBlockReader*> adaptive_filter_ptr{nullptr};
+  uint32_t adaptive_filter_touch_count = 0;
+  bool adaptive_filter_disabled = false;
+  bool adaptive_filter_scheduled = false;
+  bool adaptive_filter_building = false;
+  bool adaptive_filter_shutdown = false;
 
   enum class FilterType {
     kNoFilter,
