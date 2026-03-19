@@ -864,7 +864,7 @@ Status BlockBasedTable::Open(
 
   // Populate BlockCreateContext
   rep->create_context = BlockCreateContext(
-      &rep->table_options, &rep->ioptions, rep->ioptions.stats,
+      &rep->table_options, rep->filter_policy, &rep->ioptions, rep->ioptions.stats,
       rep->decompressor.get(), block_protection_bytes_per_key,
       rep->internal_comparator.user_comparator(), rep->index_value_is_full,
       rep->index_has_first_key, rep->data_block_restart_interval,
@@ -1136,6 +1136,19 @@ Status BlockBasedTable::ReadPropertiesBlock(
       rep_->table_properties->index_key_is_user_key == 0;
   rep_->index_value_is_full =
       rep_->table_properties->index_value_is_delta_encoded == 0;
+
+  if (!rep_->skip_filters && rep_->filter_policy == nullptr) {
+    const std::string& filter_policy_name =
+        rep_->table_properties->filter_policy_name;
+    if (filter_policy_name == ReadOnlyBuiltinFilterPolicy::kClassName() ||
+        BloomLikeFilterPolicy::Create(filter_policy_name, 1.0) != nullptr) {
+      // If the table already contains a built-in filter, preserve that read
+      // path on reopen even when the current options omit filter_policy.
+      rep_->filter_policy_holder =
+          std::make_shared<ReadOnlyBuiltinFilterPolicy>();
+      rep_->filter_policy = rep_->filter_policy_holder.get();
+    }
+  }
 
   // Read index_type from properties (required for format_version >= 2)
   auto& props = rep_->table_properties->user_collected_properties;

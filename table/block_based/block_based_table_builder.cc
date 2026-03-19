@@ -1097,7 +1097,8 @@ struct BlockBasedTableBuilder::Rep {
                 table_options, data_block)),
         warm_cache_config(WarmCacheConfig::Compute(
             table_options.prepopulate_block_cache, reason)),
-        create_context(&table_options, &ioptions, ioptions.stats,
+        create_context(&table_options, table_options.filter_policy.get(),
+                       &ioptions, ioptions.stats,
                        /*decompressor=*/nullptr,
                        tbo.moptions.block_protection_bytes_per_key,
                        tbo.internal_comparator.user_comparator(),

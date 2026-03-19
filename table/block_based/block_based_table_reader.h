@@ -610,7 +610,9 @@ struct BlockBasedTable::Rep {
       : ioptions(_ioptions),
         env_options(_env_options),
         table_options(_table_opt),
-        filter_policy(skip_filters ? nullptr : _table_opt.filter_policy.get()),
+        skip_filters(skip_filters),
+        filter_policy_holder(skip_filters ? nullptr : _table_opt.filter_policy),
+        filter_policy(filter_policy_holder.get()),
         internal_comparator(_internal_comparator),
         filter_type(FilterType::kNoFilter),
         index_type(BlockBasedTableOptions::IndexType::kBinarySearch),
@@ -627,7 +629,9 @@ struct BlockBasedTable::Rep {
   const ImmutableOptions& ioptions;
   const EnvOptions& env_options;
   const BlockBasedTableOptions table_options;
-  const FilterPolicy* const filter_policy;
+  const bool skip_filters;
+  std::shared_ptr<const FilterPolicy> filter_policy_holder;
+  const FilterPolicy* filter_policy;
   const InternalKeyComparator& internal_comparator;
   Status status;
   std::unique_ptr<RandomAccessFileReader> file;

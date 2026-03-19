@@ -2731,6 +2731,34 @@ TEST_P(BloomStatsTestWithParam, BloomStatsTest) {
   ASSERT_EQ(1, get_perf_context()->bloom_sst_miss_count);
 }
 
+TEST_F(DBBloomFilterTest,
+       ReopenWithoutFilterPolicyStillUsesBuiltinSstFilter) {
+  Options options = CurrentOptions();
+  BlockBasedTableOptions table_options;
+  SetInTableOptions(&table_options);
+  table_options.filter_policy.reset(NewBloomFilterPolicy(20, false));
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+
+  CreateAndReopenWithCF({"pikachu"}, options);
+  ASSERT_OK(Put(1, "AAAA", "Value1"));
+  ASSERT_OK(Put(1, "ZBRA", "Value3"));
+  ASSERT_OK(Flush(1));
+
+  BlockBasedTableOptions reopen_table_options;
+  SetInTableOptions(&reopen_table_options);
+  options.table_factory.reset(NewBlockBasedTableFactory(reopen_table_options));
+  ReopenWithColumnFamilies({"default", "pikachu"}, options);
+
+  get_perf_context()->Reset();
+  ASSERT_EQ("Value1", Get(1, "AAAA"));
+  ASSERT_EQ(1, get_perf_context()->bloom_sst_hit_count);
+  ASSERT_EQ(0, get_perf_context()->bloom_sst_miss_count);
+
+  ASSERT_EQ("NOT_FOUND", Get(1, "RXDB"));
+  ASSERT_EQ(1, get_perf_context()->bloom_sst_hit_count);
+  ASSERT_EQ(1, get_perf_context()->bloom_sst_miss_count);
+}
+
 // Same scenario as in BloomStatsTest but using an iterator
 TEST_P(BloomStatsTestWithParam, BloomStatsTestWithIter) {
   std::string key1("AAAA");

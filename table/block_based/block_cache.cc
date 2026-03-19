@@ -57,8 +57,9 @@ void BlockCreateContext::Create(
 
 void BlockCreateContext::Create(
     std::unique_ptr<ParsedFullFilterBlock>* parsed_out, BlockContents&& block) {
-  parsed_out->reset(new ParsedFullFilterBlock(
-      table_options->filter_policy.get(), std::move(block)));
+  assert(filter_policy != nullptr);
+  parsed_out->reset(
+      new ParsedFullFilterBlock(filter_policy, std::move(block)));
 }
 
 void BlockCreateContext::Create(std::unique_ptr<DecompressorDict>* parsed_out,
