@@ -79,6 +79,15 @@
 namespace ROCKSDB_NAMESPACE {
 namespace {
 
+constexpr uint64_t kAdaptiveFilterMaxFileSize = 64ull << 20;
+constexpr double kAdaptiveFilterBitsPerKey = 10.0;
+// Building an adaptive filter scans the whole table in the background, so wait
+// for sustained negative probes before paying that cost. This avoids
+// perturbing short positive-only request sequences and exact I/O/cache-count
+// tests while still reacting quickly to workloads that would benefit from
+// bloom-style pruning.
+constexpr uint32_t kAdaptiveFilterMinTouches = 16;
+
 CacheAllocationPtr CopyBufferToHeap(MemoryAllocator* allocator, Slice& buf) {
   CacheAllocationPtr heap_buf;
   heap_buf = AllocateBlock(buf.size(), allocator);
@@ -143,6 +152,25 @@ extern const std::string kHashIndexPrefixesBlock;
 extern const std::string kHashIndexPrefixesMetadataBlock;
 
 BlockBasedTable::~BlockBasedTable() {
+  {
+    std::unique_lock<std::mutex> lock(rep_->adaptive_filter_mu);
+    rep_->adaptive_filter_shutdown = true;
+    const bool needs_unschedule = rep_->adaptive_filter_scheduled;
+    lock.unlock();
+    int unscheduled = 0;
+    if (needs_unschedule) {
+      unscheduled = rep_->ioptions.env->UnSchedule(this, Env::Priority::LOW);
+    }
+    lock.lock();
+    if (unscheduled > 0) {
+      rep_->adaptive_filter_scheduled = false;
+    }
+    rep_->adaptive_filter_cv.wait(lock, [this] {
+      return !rep_->adaptive_filter_scheduled &&
+             !rep_->adaptive_filter_building;
+    });
+  }
+
   auto ua = rep_->uncache_aggressiveness.LoadRelaxed();
   // NOTE: there is an undiagnosed incompatibility with mmap reads,
   // where attempting to read the index below can result in bus error.
@@ -1468,6 +1496,11 @@ size_t BlockBasedTable::ApproximateMemoryUsage() const {
   if (rep_->filter) {
     usage += rep_->filter->ApproximateMemoryUsage();
   }
+  auto* adaptive_filter =
+      rep_->adaptive_filter_ptr.load(std::memory_order_acquire);
+  if (adaptive_filter != nullptr) {
+    usage += adaptive_filter->ApproximateMemoryUsage();
+  }
   if (rep_->index_reader) {
     usage += rep_->index_reader->ApproximateMemoryUsage();
   }
@@ -2415,6 +2448,161 @@ void BlockBasedTable::FullFilterKeysMayMatch(
   }
 }
 
+bool BlockBasedTable::ShouldBuildAdaptiveFilter() const {
+  if (rep_->skip_filters || rep_->filter != nullptr ||
+      rep_->filter_type != Rep::FilterType::kNoFilter ||
+      rep_->table_properties == nullptr ||
+      !rep_->table_properties->filter_policy_name.empty() ||
+      rep_->file_size == 0 || rep_->file_size > kAdaptiveFilterMaxFileSize) {
+    return false;
+  }
+
+  return rep_->whole_key_filtering ||
+         (rep_->prefix_filtering && rep_->table_prefix_extractor != nullptr);
+}
+
+Status BlockBasedTable::BuildAdaptiveFilter() {
+  if (!ShouldBuildAdaptiveFilter()) {
+    return Status::OK();
+  }
+
+  BlockBasedTableOptions adaptive_table_options = rep_->table_options;
+  auto adaptive_filter_policy = std::shared_ptr<const FilterPolicy>(
+      NewBloomFilterPolicy(kAdaptiveFilterBitsPerKey));
+  adaptive_table_options.filter_policy = adaptive_filter_policy;
+
+  FilterBuildingContext filter_context(adaptive_table_options);
+  filter_context.info_log = rep_->ioptions.logger;
+  filter_context.compaction_style = rep_->ioptions.compaction_style;
+  filter_context.num_levels = rep_->ioptions.num_levels;
+  filter_context.level_at_creation =
+      rep_->level < 0
+          ? 0
+          : std::min(rep_->level, rep_->ioptions.num_levels - 1);
+  filter_context.is_bottommost =
+      rep_->level >= rep_->ioptions.num_levels - 1;
+
+  auto* filter_bits_builder =
+      BuiltinFilterPolicy::GetBuilderFromContext(filter_context);
+  if (filter_bits_builder == nullptr) {
+    return Status::NotSupported("adaptive filter builder unavailable");
+  }
+
+  FullFilterBlockBuilder builder(rep_->table_prefix_extractor.get(),
+                                 rep_->whole_key_filtering,
+                                 filter_bits_builder);
+  ReadOptions filter_read_options;
+  filter_read_options.fill_cache = false;
+  filter_read_options.verify_checksums = false;
+  std::unique_ptr<InternalIterator> iter(
+      NewIterator(filter_read_options, rep_->table_prefix_extractor.get(),
+                  /*arena=*/nullptr, /*skip_filters=*/true,
+                  TableReaderCaller::kPrefetch));
+
+  const size_t ts_size =
+      rep_->internal_comparator.user_comparator()->timestamp_size();
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    builder.Add(
+        StripTimestampFromUserKey(ExtractUserKey(iter->key()), ts_size));
+  }
+
+  Status s = iter->status();
+  if (!s.ok()) {
+    return s;
+  }
+
+  Slice filter_slice;
+  std::unique_ptr<const char[]> filter_owner;
+  s = builder.Finish(BlockHandle(), &filter_slice, &filter_owner);
+  if (!s.ok()) {
+    return s;
+  }
+
+  std::unique_ptr<char[]> filter_bytes(new char[filter_slice.size()]);
+  memcpy(filter_bytes.get(), filter_slice.data(), filter_slice.size());
+  BlockContents filter_contents(std::move(filter_bytes), filter_slice.size());
+  auto parsed_filter = std::make_unique<ParsedFullFilterBlock>(
+      adaptive_filter_policy.get(), std::move(filter_contents));
+  CachableEntry<ParsedFullFilterBlock> filter_block;
+  filter_block.SetOwnedValue(std::move(parsed_filter));
+  rep_->adaptive_filter.reset(
+      new FullFilterBlockReader(this, std::move(filter_block)));
+  rep_->adaptive_filter_ptr.store(rep_->adaptive_filter.get(),
+                                  std::memory_order_release);
+  return Status::OK();
+}
+
+FilterBlockReader* BlockBasedTable::GetFilterForRead(
+    const ReadOptions& read_options, bool skip_filters) {
+  if (skip_filters || rep_->skip_filters) {
+    return nullptr;
+  }
+  if (rep_->filter != nullptr) {
+    return rep_->filter.get();
+  }
+
+  FilterBlockReader* adaptive_filter =
+      rep_->adaptive_filter_ptr.load(std::memory_order_acquire);
+  if (adaptive_filter != nullptr || !ShouldBuildAdaptiveFilter()) {
+    return adaptive_filter;
+  }
+  return nullptr;
+}
+
+void BlockBasedTable::MaybeScheduleAdaptiveFilterBuild(
+    const ReadOptions& read_options) {
+  if (read_options.read_tier == kBlockCacheTier ||
+      read_options.deadline != std::chrono::microseconds::zero() ||
+      read_options.io_timeout != std::chrono::microseconds::zero() ||
+      !ShouldBuildAdaptiveFilter()) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(rep_->adaptive_filter_mu);
+  if (rep_->adaptive_filter_ptr.load(std::memory_order_relaxed) != nullptr ||
+      rep_->adaptive_filter_disabled || rep_->adaptive_filter_scheduled ||
+      rep_->adaptive_filter_building || rep_->adaptive_filter_shutdown) {
+    return;
+  }
+
+  ++rep_->adaptive_filter_touch_count;
+  if (rep_->adaptive_filter_touch_count < kAdaptiveFilterMinTouches) {
+    return;
+  }
+
+  rep_->adaptive_filter_scheduled = true;
+  rep_->ioptions.env->Schedule(&BlockBasedTable::BackgroundBuildAdaptiveFilter,
+                               this, Env::Priority::LOW, this);
+}
+
+void BlockBasedTable::RunAdaptiveFilterBuild() {
+  {
+    std::lock_guard<std::mutex> lock(rep_->adaptive_filter_mu);
+    rep_->adaptive_filter_scheduled = false;
+    if (rep_->adaptive_filter_shutdown || rep_->adaptive_filter_disabled ||
+        rep_->adaptive_filter_ptr.load(std::memory_order_relaxed) != nullptr) {
+      rep_->adaptive_filter_cv.notify_all();
+      return;
+    }
+    rep_->adaptive_filter_building = true;
+  }
+
+  Status s = BuildAdaptiveFilter();
+
+  std::lock_guard<std::mutex> lock(rep_->adaptive_filter_mu);
+  rep_->adaptive_filter_building = false;
+  if (!s.ok() && rep_->adaptive_filter_ptr.load(std::memory_order_relaxed) ==
+                     nullptr) {
+    rep_->adaptive_filter_disabled = true;
+  }
+  rep_->adaptive_filter_cv.notify_all();
+  IGNORE_STATUS_IF_ERROR(s);
+}
+
+void BlockBasedTable::BackgroundBuildAdaptiveFilter(void* arg) {
+  static_cast<BlockBasedTable*>(arg)->RunAdaptiveFilterBuild();
+}
+
 Status BlockBasedTable::ApproximateKeyAnchors(const ReadOptions& read_options,
                                               std::vector<Anchor>& anchors) {
   // We iterator the whole index block here. More efficient implementation
@@ -2502,8 +2690,7 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
   assert(get_context != nullptr);
   Status s;
 
-  FilterBlockReader* const filter =
-      !skip_filters ? rep_->filter.get() : nullptr;
+  FilterBlockReader* const filter = GetFilterForRead(read_options, skip_filters);
 
   // First check the full filter
   // If full filter not useful, Then go into each block
@@ -2522,6 +2709,7 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
       FullFilterKeyMayMatch(filter, key, prefix_extractor, get_context,
                             &lookup_context, read_options);
   TEST_SYNC_POINT("BlockBasedTable::Get:AfterFilterMatch");
+  bool should_schedule_adaptive_filter = !may_match;
   if (may_match) {
     IndexBlockIter iiter_on_stack;
     // if prefix_extractor found in block differs from options, disable
@@ -2661,6 +2849,14 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
     if (s.ok() && !iiter->status().IsNotFound()) {
       s = iiter->status();
     }
+
+    if (!matched) {
+      should_schedule_adaptive_filter = true;
+    }
+  }
+
+  if (s.ok() && should_schedule_adaptive_filter) {
+    MaybeScheduleAdaptiveFilterBuild(read_options);
   }
 
   return s;
@@ -2675,7 +2871,8 @@ Status BlockBasedTable::MultiGetFilter(const ReadOptions& read_options,
     return Status::OK();  // Nothing to do
   }
 
-  FilterBlockReader* const filter = rep_->filter.get();
+  FilterBlockReader* const filter =
+      GetFilterForRead(read_options, /*skip_filters=*/false);
   if (!filter) {
     return Status::OK();
   }

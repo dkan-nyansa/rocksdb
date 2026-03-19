@@ -294,8 +294,7 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
     CO_RETURN;  // Nothing to do
   }
 
-  FilterBlockReader* const filter =
-      !skip_filters ? rep_->filter.get() : nullptr;
+  FilterBlockReader* const filter = GetFilterForRead(read_options, skip_filters);
   MultiGetRange sst_file_range(*mget_range, mget_range->begin(),
                                mget_range->end());
 
@@ -389,6 +388,9 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
             // lowest key in current block.
             if (!iiter->status().IsNotFound()) {
               *(miter->s) = iiter->status();
+            }
+            if (iiter->status().ok()) {
+              MaybeScheduleAdaptiveFilterBuild(read_options);
             }
             data_block_range.SkipKey(miter);
             sst_file_range.SkipKey(miter);
@@ -740,6 +742,9 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
         // Includes prefix stats
         PERF_COUNTER_BY_LEVEL_ADD(bloom_filter_full_true_positive, 1,
                                   rep_->level);
+      }
+      if (s.ok() && !matched) {
+        MaybeScheduleAdaptiveFilterBuild(read_options);
       }
       if (s.ok() && !iiter->status().IsNotFound()) {
         s = iiter->status();
