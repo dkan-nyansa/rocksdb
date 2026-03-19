@@ -80,6 +80,7 @@ class Block_kUserDefinedIndex : public BlockContents {
 struct BlockCreateContext : public Cache::CreateContext {
   BlockCreateContext() {}
   BlockCreateContext(const BlockBasedTableOptions* _table_options,
+                     const FilterPolicy* _filter_policy,
                      const ImmutableOptions* _ioptions, Statistics* _statistics,
                      Decompressor* _decompressor,
                      uint8_t _protection_bytes_per_key,
@@ -89,6 +90,7 @@ struct BlockCreateContext : public Cache::CreateContext {
                      uint32_t _data_block_restart_interval = 0,
                      uint32_t _index_block_restart_interval = 0)
       : table_options(_table_options),
+        filter_policy(_filter_policy),
         ioptions(_ioptions),
         statistics(_statistics),
         decompressor(_decompressor),
@@ -100,6 +102,7 @@ struct BlockCreateContext : public Cache::CreateContext {
         index_block_restart_interval(_index_block_restart_interval) {}
 
   const BlockBasedTableOptions* table_options = nullptr;
+  const FilterPolicy* filter_policy = nullptr;
   const ImmutableOptions* ioptions = nullptr;
   Statistics* statistics = nullptr;
   // TODO: refactor to avoid copying BlockCreateContext for dict in block cache
