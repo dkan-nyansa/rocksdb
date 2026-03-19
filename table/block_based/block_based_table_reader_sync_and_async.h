@@ -363,16 +363,41 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
       {
         using BCI = BlockCacheInterface<Block_kData>;
         BCI block_cache{rep_->table_options.block_cache.get()};
+        UserComparatorWrapper user_comparator(
+            rep_->internal_comparator.user_comparator());
         std::array<BCI::TypedAsyncLookupHandle, MultiGetContext::MAX_BATCH_SIZE>
             async_handles;
         BlockCreateContext create_ctx = rep_->create_context;
         std::array<CacheKey, MultiGetContext::MAX_BATCH_SIZE> cache_keys;
         size_t cache_lookup_count = 0;
+        Slice prev_lookup_key_in_sst;
+        bool have_prev_lookup_key_in_sst = false;
 
         for (auto miter = data_block_range.begin();
              miter != data_block_range.end(); ++miter) {
           const Slice& key = miter->ikey;
-          iiter->Seek(miter->ikey);
+          if (have_prev_lookup_key_in_sst && iiter->status().ok() &&
+              iiter->Valid() &&
+              rep_->internal_comparator.Compare(prev_lookup_key_in_sst, key) <=
+                  0) {
+            if (rep_->index_key_includes_seq) {
+              while (iiter->Valid() &&
+                     rep_->internal_comparator.Compare(iiter->key(), key) < 0) {
+                iiter->Next();
+              }
+            } else {
+              Slice user_key = ExtractUserKey(key);
+              while (iiter->Valid() &&
+                     user_comparator.CompareWithoutTimestamp(iiter->user_key(),
+                                                            user_key) < 0) {
+                iiter->Next();
+              }
+            }
+          } else {
+            iiter->Seek(key);
+          }
+          prev_lookup_key_in_sst = key;
+          have_prev_lookup_key_in_sst = true;
 
           IndexValue v;
           if (iiter->Valid()) {
@@ -380,11 +405,9 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
           }
           if (!iiter->Valid() ||
               (!v.first_internal_key.empty() && !skip_filters &&
-               UserComparatorWrapper(
-                   rep_->internal_comparator.user_comparator())
-                       .CompareWithoutTimestamp(
-                           ExtractUserKey(key),
-                           ExtractUserKey(v.first_internal_key)) < 0)) {
+               user_comparator.CompareWithoutTimestamp(
+                   ExtractUserKey(key),
+                   ExtractUserKey(v.first_internal_key)) < 0)) {
             // The requested key falls between highest key in previous block and
             // lowest key in current block.
             if (!iiter->status().IsNotFound()) {
