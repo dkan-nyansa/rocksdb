@@ -370,8 +370,38 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
         BlockCreateContext create_ctx = rep_->create_context;
         std::array<CacheKey, MultiGetContext::MAX_BATCH_SIZE> cache_keys;
         size_t cache_lookup_count = 0;
+        // Bounded linear advance preserves the win for clustered keys without
+        // turning large sparse batches into long index scans.
+        constexpr size_t kMaxIndexNextsBeforeSeek = 4;
         Slice prev_lookup_key_in_sst;
         bool have_prev_lookup_key_in_sst = false;
+        auto advance_index_or_seek = [&](const Slice& target_key) {
+          size_t index_steps = 0;
+          if (rep_->index_key_includes_seq) {
+            while (iiter->Valid() &&
+                   rep_->internal_comparator.Compare(iiter->key(),
+                                                     target_key) < 0) {
+              if (index_steps >= kMaxIndexNextsBeforeSeek) {
+                iiter->Seek(target_key);
+                return;
+              }
+              iiter->Next();
+              ++index_steps;
+            }
+          } else {
+            Slice user_key = ExtractUserKey(target_key);
+            while (iiter->Valid() &&
+                   user_comparator.CompareWithoutTimestamp(iiter->user_key(),
+                                                          user_key) < 0) {
+              if (index_steps >= kMaxIndexNextsBeforeSeek) {
+                iiter->Seek(target_key);
+                return;
+              }
+              iiter->Next();
+              ++index_steps;
+            }
+          }
+        };
 
         for (auto miter = data_block_range.begin();
              miter != data_block_range.end(); ++miter) {
@@ -380,19 +410,7 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
               iiter->Valid() &&
               rep_->internal_comparator.Compare(prev_lookup_key_in_sst, key) <=
                   0) {
-            if (rep_->index_key_includes_seq) {
-              while (iiter->Valid() &&
-                     rep_->internal_comparator.Compare(iiter->key(), key) < 0) {
-                iiter->Next();
-              }
-            } else {
-              Slice user_key = ExtractUserKey(key);
-              while (iiter->Valid() &&
-                     user_comparator.CompareWithoutTimestamp(iiter->user_key(),
-                                                            user_key) < 0) {
-                iiter->Next();
-              }
-            }
+            advance_index_or_seek(key);
           } else {
             iiter->Seek(key);
           }
